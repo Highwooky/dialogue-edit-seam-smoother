@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Dialogue Edit Seam Smoother core engine.
+Dialogue Edit Repair MVP (shape-safe hotfix)
 
-목표:
-- 대사 편집점의 '뚝 끊김', '틱', 접합 이질감을 부드럽게 완화
-- 클릭 제거기보다 seam smoothing 관점으로 설계
-- marker 기반 반자동 처리 우선, auto scan은 보조
+핵심 수정:
+- moving_rms()가 항상 입력과 동일한 길이를 반환하도록 수정
+- detection feature 배열 길이 안전 정렬 추가
+- auto_collect_candidates()에서 배열 길이 불일치가 나지 않도록 보강
+- 간단한 자체 테스트 추가
 
-의존성:
-    pip install numpy scipy soundfile
+이 파일은 기존 dialogue_edit_repair_mvp.py 를 교체하는 용도다.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import argparse
 import csv
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -28,29 +28,32 @@ from scipy.signal import butter, sosfiltfilt
 @dataclass
 class RepairConfig:
     auto_detect: bool = True
-    marker_window_ms: float = 30.0
-    analysis_window_ms: float = 8.0
-    pre_context_ms: float = 10.0
-    post_context_ms: float = 10.0
-    micro_fade_ms: float = 1.0
-    crossfade_ms: float = 4.0
+    marker_window_ms: float = 20.0
+    detect_window_ms: float = 2.5
+    repair_half_ms: float = 0.6
+    min_separation_ms: float = 3.0
     sensitivity: float = 1.0
-    seam_threshold: float = 0.55
-    protect_transients: bool = True
-    transient_protect_strength: float = 0.8
-    min_separation_ms: float = 8.0
+    protect_claps: bool = True
+    clap_protect_strength: float = 1.0
+    transient_protect: bool = True
+    peak_z_threshold: float = 6.0
+    deriv_z_threshold: float = 5.0
+    hf_z_threshold: float = 4.0
+    clip_score_threshold: float = 0.85
 
 
 @dataclass
-class SeamEvent:
+class CandidateEvent:
     sample_index: int
     time_sec: float
-    rms_jump: float
-    corr_loss: float
-    dc_jump: float
-    spectral_mismatch: float
+    peak_z: float
+    deriv_z: float
+    hf_z: float
+    asymmetry: float
+    duration_ms: float
+    clap_score: float
     transient_score: float
-    seam_score: float
+    click_score: float
     decision: str
 
 
@@ -60,49 +63,8 @@ def ms_to_samples(ms: float, sr: int) -> int:
 
 def safe_mono(x: np.ndarray) -> np.ndarray:
     if x.ndim == 1:
-        return x.astype(np.float64, copy=False)
-    return np.mean(x, axis=1, dtype=np.float64)
-
-
-# keep old API name for app compatibility if needed
-ensure_mono = safe_mono
-
-
-def read_markers(path: Optional[str]) -> List[float]:
-    if not path:
-        return []
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Marker file not found: {p}")
-    out: List[float] = []
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # allow csv row with first field as seconds
-        first = line.split(",", 1)[0].strip()
-        out.append(float(first))
-    return out
-
-
-def merge_close_indices(indices: np.ndarray, min_gap: int) -> np.ndarray:
-    if len(indices) == 0:
-        return indices.astype(np.int64)
-    indices = np.sort(indices)
-    merged = [int(indices[0])]
-    for idx in indices[1:]:
-        if idx - merged[-1] >= min_gap:
-            merged.append(int(idx))
-    return np.asarray(merged, dtype=np.int64)
-
-
-def moving_rms(x: np.ndarray, win: int) -> np.ndarray:
-    win = max(1, int(win))
-    pad = win // 2
-    xp = np.pad(x * x, (pad, pad), mode="reflect")
-    kernel = np.ones(win, dtype=np.float64) / win
-    y = np.convolve(xp, kernel, mode="valid")
-    return np.sqrt(np.maximum(y, 1e-12))
+        return x
+    return np.mean(x, axis=1)
 
 
 def robust_z(x: np.ndarray) -> np.ndarray:
@@ -111,212 +73,313 @@ def robust_z(x: np.ndarray) -> np.ndarray:
     return 0.6745 * (x - med) / mad
 
 
+def moving_rms(x: np.ndarray, win: int) -> np.ndarray:
+    """Return RMS envelope with exactly the same length as input.
+
+    Previous versions could return len(x)+1 when win was even.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    win = max(1, int(win))
+    if x.size == 0:
+        return np.array([], dtype=np.float64)
+    kernel = np.ones(win, dtype=np.float64) / win
+    y = np.convolve(x * x, kernel, mode="same")
+    if len(y) < len(x):
+        y = np.pad(y, (0, len(x) - len(y)), mode="edge")
+    elif len(y) > len(x):
+        y = y[: len(x)]
+    return np.sqrt(np.maximum(y, 1e-15))
+
+
 def bandpass(x: np.ndarray, sr: int, low: float, high: float, order: int = 4) -> np.ndarray:
     nyq = sr * 0.5
-    low_n = max(low / nyq, 1e-5)
-    high_n = min(high / nyq, 0.999)
+    low_n = max(1e-5, low / nyq)
+    high_n = min(0.999, high / nyq)
     if high_n <= low_n:
         return x.copy()
     sos = butter(order, [low_n, high_n], btype="bandpass", output="sos")
     return sosfiltfilt(sos, x)
 
 
-def short_spectrum(seg: np.ndarray, n_fft: int) -> np.ndarray:
-    if len(seg) < n_fft:
-        seg = np.pad(seg, (0, n_fft - len(seg)))
-    win = np.hanning(n_fft)
-    spec = np.fft.rfft(seg[:n_fft] * win)
-    mag = np.abs(spec)
-    return mag / (np.sum(mag) + 1e-12)
+def merge_close_indices(indices: np.ndarray, min_gap: int) -> np.ndarray:
+    if len(indices) == 0:
+        return indices
+    indices = np.sort(indices)
+    merged = [int(indices[0])]
+    for idx in indices[1:]:
+        if idx - merged[-1] >= min_gap:
+            merged.append(int(idx))
+    return np.asarray(merged, dtype=np.int64)
 
 
-def compute_transient_score(x: np.ndarray, sr: int, center: int) -> float:
-    w = ms_to_samples(15.0, sr)
-    a = max(0, center - w)
-    b = min(len(x), center + w)
-    seg = x[a:b]
-    if len(seg) < 32:
+def read_markers(path: Optional[str]) -> List[float]:
+    if not path:
+        return []
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Marker file not found: {p}")
+    markers = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        markers.append(float(line))
+    return markers
+
+
+def _match_length(*arrays: np.ndarray) -> Tuple[np.ndarray, ...]:
+    n = min(len(a) for a in arrays) if arrays else 0
+    return tuple(np.asarray(a[:n]) for a in arrays)
+
+
+def compute_detection_features(mono: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    x = mono.astype(np.float64)
+
+    abs_peak_z = np.abs(robust_z(np.abs(x)))
+    d1 = np.diff(x, prepend=x[0])
+    deriv_z = np.abs(robust_z(np.abs(d1)))
+
+    hf = bandpass(x, sr, 2500.0, min(12000.0, sr * 0.45), order=4)
+    hf_env = moving_rms(hf, ms_to_samples(0.35, sr))
+    hf_z = np.abs(robust_z(hf_env))
+
+    local_rms = moving_rms(x, ms_to_samples(5.0, sr))
+
+    abs_peak_z, deriv_z, hf_z, local_rms = _match_length(abs_peak_z, deriv_z, hf_z, local_rms)
+    return abs_peak_z, deriv_z, hf_z, local_rms
+
+
+def estimate_event_duration(hf_env: np.ndarray, center: int, sr: int) -> float:
+    n = len(hf_env)
+    c = int(np.clip(center, 0, n - 1))
+    peak = hf_env[c]
+    if peak <= 1e-12:
         return 0.0
-    env = moving_rms(seg, ms_to_samples(0.5, sr))
-    c = np.clip(center - a, 1, len(env) - 2)
-    pre = float(np.mean(env[max(0, c - ms_to_samples(3.0, sr)):c]) + 1e-12)
-    post = float(np.mean(env[c:min(len(env), c + ms_to_samples(8.0, sr))]) + 1e-12)
-    ratio = post / pre
-    return float(np.clip((ratio - 1.2) / 4.0, 0.0, 1.0))
+    thr = peak * 0.25
+    l = c
+    while l > 0 and hf_env[l] > thr:
+        l -= 1
+    r = c
+    while r < n - 1 and hf_env[r] > thr:
+        r += 1
+    return (r - l) * 1000.0 / sr
 
 
-def evaluate_one_seam(x: np.ndarray, sr: int, center: int, cfg: RepairConfig) -> SeamEvent:
-    pre = ms_to_samples(cfg.pre_context_ms, sr)
-    post = ms_to_samples(cfg.post_context_ms, sr)
-    a0 = max(0, center - pre)
-    a1 = max(0, center)
-    b0 = min(len(x), center)
-    b1 = min(len(x), center + post)
-    left = x[a0:a1]
-    right = x[b0:b1]
+def compute_asymmetry(x: np.ndarray, center: int, width: int) -> float:
+    n = len(x)
+    l0 = max(0, center - width)
+    l1 = max(0, center)
+    r0 = min(n, center)
+    r1 = min(n, center + width)
+    left = x[l0:l1]
+    right = x[r0:r1]
     m = min(len(left), len(right))
-    if m < 16:
-        return SeamEvent(center, center / sr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "skip")
+    if m < 8:
+        return 0.0
     left = left[-m:]
     right = right[:m]
-
-    left_rms = float(np.sqrt(np.mean(left * left)) + 1e-12)
-    right_rms = float(np.sqrt(np.mean(right * right)) + 1e-12)
-    rms_jump = abs(np.log10(right_rms / left_rms)) * 2.0
-
     denom = (np.linalg.norm(left) * np.linalg.norm(right)) + 1e-12
     corr = float(np.dot(left, right) / denom)
-    corr_loss = 1.0 - np.clip((corr + 1.0) * 0.5, 0.0, 1.0)
-
-    dc_jump = abs(float(x[min(len(x) - 1, center)] - x[max(0, center - 1)]))
-    dc_jump = float(np.clip(dc_jump * 5.0, 0.0, 1.0))
-
-    n_fft = 1
-    while n_fft < m:
-        n_fft *= 2
-    n_fft = max(64, min(n_fft, 1024))
-    lspec = short_spectrum(left, n_fft)
-    rspec = short_spectrum(right, n_fft)
-    spectral_mismatch = float(np.clip(np.mean(np.abs(lspec - rspec)) * 10.0, 0.0, 1.0))
-
-    transient_score = compute_transient_score(x, sr, center) if cfg.protect_transients else 0.0
-
-    seam_score = (
-        0.28 * np.clip(rms_jump, 0.0, 1.0)
-        + 0.28 * np.clip(corr_loss, 0.0, 1.0)
-        + 0.20 * np.clip(dc_jump, 0.0, 1.0)
-        + 0.24 * np.clip(spectral_mismatch, 0.0, 1.0)
-    )
-    seam_score *= cfg.sensitivity
-    seam_score *= (1.0 - transient_score * 0.45 * cfg.transient_protect_strength)
-    seam_score = float(np.clip(seam_score, 0.0, 1.5))
-
-    decision = "repair" if seam_score >= cfg.seam_threshold else "skip"
-    return SeamEvent(
-        sample_index=center,
-        time_sec=center / sr,
-        rms_jump=float(np.clip(rms_jump, 0.0, 1.0)),
-        corr_loss=float(np.clip(corr_loss, 0.0, 1.0)),
-        dc_jump=dc_jump,
-        spectral_mismatch=spectral_mismatch,
-        transient_score=transient_score,
-        seam_score=seam_score,
-        decision=decision,
-    )
+    return 1.0 - max(-1.0, min(1.0, corr))
 
 
-def marker_collect_candidates(mono: np.ndarray, sr: int, markers_sec: Sequence[float], cfg: RepairConfig) -> np.ndarray:
-    if not markers_sec:
-        return np.asarray([], dtype=np.int64)
-    search = ms_to_samples(cfg.marker_window_ms, sr)
-    d = np.abs(np.diff(mono, prepend=mono[0]))
-    hf = moving_rms(bandpass(mono, sr, 2000.0, min(sr * 0.45, 12000.0)), ms_to_samples(0.6, sr))
-    out: List[int] = []
-    for t in markers_sec:
-        c = int(round(t * sr))
-        a = max(0, c - search)
-        b = min(len(mono), c + search)
-        if b - a < 8:
-            continue
-        combo = robust_z(d[a:b]) + robust_z(hf[a:b])
-        best = a + int(np.argmax(combo))
-        out.append(best)
-    return merge_close_indices(np.asarray(out, dtype=np.int64), ms_to_samples(cfg.min_separation_ms, sr))
+def compute_clap_score(mono: np.ndarray, sr: int, center: int) -> float:
+    pre = ms_to_samples(20.0, sr)
+    post = ms_to_samples(60.0, sr)
+    a = max(0, center - pre)
+    b = min(len(mono), center + post)
+    seg = mono[a:b]
+    if len(seg) < ms_to_samples(10, sr):
+        return 0.0
+
+    bp = bandpass(seg, sr, 1200.0, min(10000.0, sr * 0.45))
+    env = moving_rms(bp, ms_to_samples(0.5, sr))
+    if len(env) < 10:
+        return 0.0
+
+    c = center - a
+    c = int(np.clip(c, 0, len(env) - 1))
+    peak = float(env[c]) + 1e-12
+    tail_end = min(len(env), c + ms_to_samples(18.0, sr))
+    tail = env[c:tail_end]
+    tail_ratio = float(np.mean(tail) / peak) if len(tail) else 0.0
+    dur_ms = estimate_event_duration(env, c, sr)
+    dur_score = np.clip((dur_ms - 1.5) / 8.0, 0.0, 1.0)
+
+    peak_mask = env > (0.55 * np.max(env))
+    rising = np.diff(peak_mask.astype(np.int8), prepend=0)
+    peak_groups = int(np.sum(rising == 1))
+    repeat_score = np.clip((peak_groups - 1) / 3.0, 0.0, 1.0)
+    tail_score = np.clip((tail_ratio - 0.15) / 0.45, 0.0, 1.0)
+    return float(np.clip(0.50 * dur_score + 0.35 * tail_score + 0.15 * repeat_score, 0.0, 1.0))
+
+
+def compute_transient_score(mono: np.ndarray, sr: int, center: int) -> float:
+    w = ms_to_samples(12.0, sr)
+    a = max(0, center - w)
+    b = min(len(mono), center + w)
+    seg = mono[a:b]
+    if len(seg) < 16:
+        return 0.0
+
+    env = moving_rms(seg, ms_to_samples(0.4, sr))
+    c = center - a
+    c = int(np.clip(c, 1, len(env) - 2))
+    pre = float(np.mean(env[max(0, c - ms_to_samples(2.0, sr)):c]) + 1e-12)
+    post = float(np.mean(env[c:min(len(env), c + ms_to_samples(6.0, sr))]) + 1e-12)
+    ratio = post / pre
+    return float(np.clip((ratio - 1.2) / 3.0, 0.0, 1.0))
+
+
+def compute_click_score(peak_z: float, deriv_z: float, hf_z: float, asymmetry: float, duration_ms: float, clap_score: float, transient_score: float, cfg: RepairConfig) -> float:
+    shortness = 1.0 - np.clip((duration_ms - 0.8) / 5.0, 0.0, 1.0)
+    peak_term = np.clip(peak_z / cfg.peak_z_threshold, 0.0, 2.0)
+    deriv_term = np.clip(deriv_z / cfg.deriv_z_threshold, 0.0, 2.0)
+    hf_term = np.clip(hf_z / cfg.hf_z_threshold, 0.0, 2.0)
+    asym_term = np.clip(asymmetry, 0.0, 1.0)
+
+    score = 0.28 * peak_term + 0.30 * deriv_term + 0.24 * hf_term + 0.18 * asym_term
+    score *= (0.60 + 0.40 * shortness)
+
+    if cfg.protect_claps:
+        score *= (1.0 - 0.70 * cfg.clap_protect_strength * np.clip(clap_score, 0.0, 1.0))
+    if cfg.transient_protect:
+        score *= (1.0 - 0.40 * np.clip(transient_score, 0.0, 1.0))
+    return float(np.clip(score, 0.0, 2.0))
 
 
 def auto_collect_candidates(mono: np.ndarray, sr: int, cfg: RepairConfig) -> np.ndarray:
-    # broad seam scan: find abrupt RMS / spectral flux / diff changes
-    env = moving_rms(mono, ms_to_samples(cfg.analysis_window_ms, sr))
-    env_diff = np.abs(np.diff(env, prepend=env[0]))
-    d = np.abs(np.diff(mono, prepend=mono[0]))
-    hf = moving_rms(bandpass(mono, sr, 2000.0, min(sr * 0.45, 12000.0)), ms_to_samples(0.8, sr))
-    score = np.clip(robust_z(env_diff), 0.0, None) + 0.6 * np.clip(robust_z(d), 0.0, None) + 0.4 * np.clip(robust_z(hf), 0.0, None)
-    hits = np.where(score > (3.8 / max(cfg.sensitivity, 0.1)))[0]
-    return merge_close_indices(hits.astype(np.int64), ms_to_samples(cfg.min_separation_ms, sr))
+    abs_peak_z, deriv_z, hf_z, _ = compute_detection_features(mono, sr)
+    abs_peak_z, deriv_z, hf_z = _match_length(abs_peak_z, deriv_z, hf_z)
+
+    peak_hits = np.where(abs_peak_z > (cfg.peak_z_threshold / max(cfg.sensitivity, 1e-6)))[0]
+    deriv_hits = np.where(deriv_z > (cfg.deriv_z_threshold / max(cfg.sensitivity, 1e-6)))[0]
+    hf_hits = np.where(hf_z > (cfg.hf_z_threshold / max(cfg.sensitivity, 1e-6)))[0]
+
+    all_hits = np.unique(np.concatenate([peak_hits, deriv_hits, hf_hits]))
+    min_gap = ms_to_samples(cfg.min_separation_ms, sr)
+    return merge_close_indices(all_hits, min_gap)
 
 
-def evaluate_candidates(mono: np.ndarray, sr: int, candidates: np.ndarray, cfg: RepairConfig) -> List[SeamEvent]:
-    return [evaluate_one_seam(mono, sr, int(c), cfg) for c in candidates]
+def marker_collect_candidates(mono: np.ndarray, sr: int, markers_sec: List[float], cfg: RepairConfig) -> np.ndarray:
+    if not markers_sec:
+        return np.asarray([], dtype=np.int64)
+
+    abs_peak_z, deriv_z, hf_z, _ = compute_detection_features(mono, sr)
+    abs_peak_z, deriv_z, hf_z = _match_length(abs_peak_z, deriv_z, hf_z)
+    win = ms_to_samples(cfg.marker_window_ms, sr)
+    out = []
+
+    for t in markers_sec:
+        c = int(round(t * sr))
+        c = max(0, min(len(abs_peak_z) - 1, c))
+        a = max(0, c - win)
+        b = min(len(abs_peak_z), c + win)
+        if b - a < 8:
+            continue
+        combo = (
+            np.clip(abs_peak_z[a:b] / cfg.peak_z_threshold, 0, None)
+            + np.clip(deriv_z[a:b] / cfg.deriv_z_threshold, 0, None)
+            + np.clip(hf_z[a:b] / cfg.hf_z_threshold, 0, None)
+        )
+        best = a + int(np.argmax(combo))
+        out.append(best)
+
+    min_gap = ms_to_samples(cfg.min_separation_ms, sr)
+    return merge_close_indices(np.asarray(out, dtype=np.int64), min_gap)
 
 
-def smooth_region(channel: np.ndarray, center: int, sr: int, cfg: RepairConfig) -> np.ndarray:
-    y = channel.copy().astype(np.float64)
-    fade = ms_to_samples(cfg.micro_fade_ms, sr)
-    cf = ms_to_samples(cfg.crossfade_ms, sr)
-    a = max(1, center - cf)
-    b = min(len(y) - 2, center + cf)
+def evaluate_candidates(mono: np.ndarray, sr: int, candidates: np.ndarray, cfg: RepairConfig) -> List[CandidateEvent]:
+    abs_peak_z, deriv_z, hf_z, _ = compute_detection_features(mono, sr)
+    hf = bandpass(mono, sr, 2500.0, min(12000.0, sr * 0.45), order=4)
+    hf_env = moving_rms(hf, ms_to_samples(0.35, sr))
+    n = min(len(mono), len(abs_peak_z), len(deriv_z), len(hf_z), len(hf_env))
+    mono = mono[:n]
+    abs_peak_z = abs_peak_z[:n]
+    deriv_z = deriv_z[:n]
+    hf_z = hf_z[:n]
+    hf_env = hf_env[:n]
+
+    events: List[CandidateEvent] = []
+    asym_w = ms_to_samples(0.8, sr)
+    for c in candidates:
+        c = int(np.clip(c, 0, n - 1))
+        pz = float(abs_peak_z[c])
+        dz = float(deriv_z[c])
+        hz = float(hf_z[c])
+        asym = float(compute_asymmetry(mono, c, asym_w))
+        dur = float(estimate_event_duration(hf_env, c, sr))
+        clap_score = float(compute_clap_score(mono, sr, c))
+        trans_score = float(compute_transient_score(mono, sr, c))
+        click_score = float(compute_click_score(pz, dz, hz, asym, dur, clap_score, trans_score, cfg))
+        decision = "repair" if click_score >= cfg.clip_score_threshold else "skip"
+        events.append(CandidateEvent(c, c / sr, pz, dz, hz, asym, dur, clap_score, trans_score, click_score, decision))
+    return events
+
+
+def repair_click_region(channel: np.ndarray, center: int, half_width: int) -> np.ndarray:
+    y = channel.copy()
+    n = len(y)
+    a = max(1, center - half_width)
+    b = min(n - 2, center + half_width)
     if b <= a + 1:
         return y
-
-    left = y[a:center]
-    right = y[center:b]
-    m = min(len(left), len(right))
-    if m < 4:
-        return y
-    left = left[-m:]
-    right = right[:m]
-    t = np.linspace(0.0, 1.0, m, dtype=np.float64)
-    xfade = left * (1.0 - t) + right * t
-    y[center - m:center] = xfade
-    y[center:center + m] = xfade
-
-    # micro fade around the seam to soften residual edge
-    fa = max(0, center - fade)
-    fb = min(len(y), center + fade)
-    seg = y[fa:fb].copy()
-    if len(seg) >= 4:
-        half = len(seg) // 2
-        fade_out = np.linspace(1.0, 0.7, half, dtype=np.float64)
-        fade_in = np.linspace(0.7, 1.0, len(seg) - half, dtype=np.float64)
-        env = np.concatenate([fade_out, fade_in])
-        y[fa:fb] = seg * env
+    left = y[a - 1]
+    right = y[b + 1]
+    interp = np.linspace(left, right, (b - a + 1), dtype=np.float64)
+    orig = y[a:b + 1].astype(np.float64)
+    t = np.linspace(0.0, 1.0, len(orig), dtype=np.float64)
+    blend = 0.85 - 0.25 * np.cos(2.0 * np.pi * t)
+    blend = np.clip(blend, 0.55, 1.0)
+    y[a:b + 1] = (1.0 - blend) * orig + blend * interp
     return y
 
 
-def apply_repairs(audio: np.ndarray, sr: int, events: Sequence[SeamEvent], cfg: RepairConfig) -> np.ndarray:
-    repair_events = [ev for ev in events if getattr(ev, "decision", "") == "repair"]
+def apply_repairs(audio: np.ndarray, sr: int, events: List[CandidateEvent], cfg: RepairConfig) -> np.ndarray:
     out = audio.copy().astype(np.float64)
-    for ev in repair_events:
-        c = int(ev.sample_index)
+    half = ms_to_samples(cfg.repair_half_ms, sr)
+    for ev in events:
+        if ev.decision != "repair":
+            continue
+        c = ev.sample_index
         if out.ndim == 1:
-            out = smooth_region(out, c, sr, cfg)
+            out = repair_click_region(out, c, half)
         else:
             for ch in range(out.shape[1]):
-                out[:, ch] = smooth_region(out[:, ch], c, sr, cfg)
+                out[:, ch] = repair_click_region(out[:, ch], c, half)
     return out
 
 
-def write_report(path: str, events: Sequence[SeamEvent]) -> None:
+def write_report(path: str, events: List[CandidateEvent]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(asdict(events[0]).keys()) if events else [
-        "sample_index", "time_sec", "rms_jump", "corr_loss", "dc_jump", "spectral_mismatch",
-        "transient_score", "seam_score", "decision"
-    ]
     with p.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=list(asdict(events[0]).keys()) if events else [
+            "sample_index", "time_sec", "peak_z", "deriv_z", "hf_z", "asymmetry",
+            "duration_ms", "clap_score", "transient_score", "click_score", "decision"
+        ])
         writer.writeheader()
         for ev in events:
             writer.writerow(asdict(ev))
 
 
-def process_file(
-    input_path: str,
-    output_path: str,
-    report_path: Optional[str],
-    markers_path: Optional[str],
-    cfg: RepairConfig,
-) -> Tuple[np.ndarray, int, List[SeamEvent]]:
+def process_file(input_path: str, output_path: str, report_path: Optional[str], markers_path: Optional[str], cfg: RepairConfig) -> Tuple[np.ndarray, int, List[CandidateEvent]]:
     audio, sr = sf.read(input_path, always_2d=False)
     mono = safe_mono(audio)
     markers_sec = read_markers(markers_path)
+
     candidate_sets = []
     if markers_sec:
         candidate_sets.append(marker_collect_candidates(mono, sr, markers_sec, cfg))
     if cfg.auto_detect or not markers_sec:
         candidate_sets.append(auto_collect_candidates(mono, sr, cfg))
-    candidates = np.unique(np.concatenate(candidate_sets)) if candidate_sets else np.asarray([], dtype=np.int64)
-    candidates = merge_close_indices(candidates, ms_to_samples(cfg.min_separation_ms, sr))
+
+    if candidate_sets:
+        candidates = np.unique(np.concatenate(candidate_sets))
+        candidates = merge_close_indices(candidates, ms_to_samples(cfg.min_separation_ms, sr))
+    else:
+        candidates = np.asarray([], dtype=np.int64)
+
     events = evaluate_candidates(mono, sr, candidates, cfg)
     repaired = apply_repairs(audio, sr, events, cfg)
     sf.write(output_path, repaired, sr)
@@ -325,17 +388,28 @@ def process_file(
     return repaired, sr, events
 
 
+def _run_self_tests() -> None:
+    x = np.linspace(-1.0, 1.0, 1000, dtype=np.float64)
+    for win in [1, 2, 3, 16, 17, 240, 241]:
+        y = moving_rms(x, win)
+        assert len(y) == len(x), f"moving_rms mismatch: win={win}, got={len(y)}, want={len(x)}"
+    a, b, c, d = compute_detection_features(x, 48000)
+    n = len(x)
+    assert len(a) == n and len(b) == n and len(c) == n and len(d) == n
+
+
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Dialogue Edit Seam Smoother")
-    p.add_argument("--input", required=True)
-    p.add_argument("--output", required=True)
-    p.add_argument("--report", default="")
-    p.add_argument("--markers", default="")
-    p.add_argument("--no-auto-detect", action="store_true")
-    p.add_argument("--sensitivity", type=float, default=1.0)
-    p.add_argument("--crossfade-ms", type=float, default=4.0)
-    p.add_argument("--micro-fade-ms", type=float, default=1.0)
-    p.add_argument("--threshold", type=float, default=0.55)
+    p = argparse.ArgumentParser(description="Dialogue edit click repair MVP")
+    p.add_argument("--input", required=True, help="입력 WAV/AIFF 파일")
+    p.add_argument("--output", required=True, help="출력 WAV 파일")
+    p.add_argument("--report", default="", help="CSV 리포트 저장 경로")
+    p.add_argument("--markers", default="", help="초 단위 편집점 목록 txt 파일")
+    p.add_argument("--no-auto-detect", action="store_true", help="자동 탐지 비활성화")
+    p.add_argument("--sensitivity", type=float, default=1.0, help="탐지 민감도")
+    p.add_argument("--repair-half-ms", type=float, default=0.6, help="복원 반폭(ms)")
+    p.add_argument("--clip-threshold", type=float, default=0.85, help="최종 클릭 판정 임계치")
+    p.add_argument("--disable-clap-protect", action="store_true", help="박수 보호 비활성화")
+    p.add_argument("--disable-transient-protect", action="store_true", help="일반 트랜지언트 보호 비활성화")
     return p
 
 
@@ -344,9 +418,10 @@ def main() -> None:
     cfg = RepairConfig(
         auto_detect=not args.no_auto_detect,
         sensitivity=max(0.1, float(args.sensitivity)),
-        crossfade_ms=max(0.5, float(args.crossfade_ms)),
-        micro_fade_ms=max(0.2, float(args.micro_fade_ms)),
-        seam_threshold=max(0.1, float(args.threshold)),
+        repair_half_ms=max(0.1, float(args.repair_half_ms)),
+        clip_score_threshold=max(0.1, float(args.clip_threshold)),
+        protect_claps=not args.disable_clap_protect,
+        transient_protect=not args.disable_transient_protect,
     )
     _, sr, events = process_file(
         input_path=args.input,
@@ -356,13 +431,16 @@ def main() -> None:
         cfg=cfg,
     )
     repaired_count = sum(1 for e in events if e.decision == "repair")
+    skipped_count = sum(1 for e in events if e.decision != "repair")
     print("=" * 60)
-    print("Dialogue Edit Seam Smoother complete")
+    print("Dialogue Edit Repair MVP 완료")
     print(f"Sample Rate   : {sr} Hz")
     print(f"Candidates    : {len(events)}")
     print(f"Repaired      : {repaired_count}")
+    print(f"Skipped       : {skipped_count}")
     print("=" * 60)
 
 
 if __name__ == "__main__":
+    _run_self_tests()
     main()
