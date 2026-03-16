@@ -1,0 +1,6 @@
+PyQt6
+pyqtgraph
+numpy
+scipy
+soundfile>=0.12
+pyinstaller
